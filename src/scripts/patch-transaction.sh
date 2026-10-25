@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+# Shared lock and recoverable, hash-guarded text-file transactions.
+# Hooks have separate side effects and are deliberately outside this journal.
+transaction_status() {
+    [[ "${PVE_MODs_CHECK_ONLY:-0}" != 1 ]] || return 0
+    local mod="$1" status="$2" reason="$3" state tmp automatic=false
+    [[ "$mod" =~ ^[a-zA-Z0-9_-]+$ ]] || return 1
+    state="${PVE_MODs_STATE_DIR:-${PVE_MODs_ROOT%/}/var/lib/pve-mods}/status"
+    mkdir -p "$state" || return 1
+    [[ "${PVE_MODs_AUTOMATIC:-0}" == 1 ]] && automatic=true
+    reason="${reason//\\/\\\\}"; reason="${reason//\"/\\\"}"
+    reason="${reason//$'\n'/ }"; reason="${reason//$'\t'/ }"
+    tmp=$(mktemp "$state/.status.XXXXXX") || return 1
+    printf '{"module":"%s","state":"%s","reason":"%s","timestamp":"%s","automatic":%s}\n' \
+        "$mod" "$status" "$reason" "$(date -u +%FT%TZ)" "$automatic" > "$tmp"
+    mv -fT "$tmp" "$state/$mod.json"
+}
+transaction_lock() {
+    local root="${PVE_MODs_ROOT:-/}"
+    local lock="${PVE_MODs_LOCK_FILE:-${PVE_MODs_STATE_DIR:-${root%/}/var/lib/pve-mods}/lifecycle.lock}"
+    mkdir -p "$(dirname "$lock")" || return 1
+    exec {PVE_MODs_LOCK_FD}>"$lock" || return 1
+    flock -w "${PVE_MODs_LOCK_TIMEOUT:-30}" "$PVE_MODs_LOCK_FD" || {
+        echo '[pve-mods] lifecycle busy; no changes made' >&2; return 1;
+    }
+}
+transaction_target_safe() {
+    local component checkroot="$PVE_MODs_ROOT"
+    local -a components
+    IFS=/ read -ra components <<< "$1"
+    for component in "${components[@]}"; do
+        checkroot="$checkroot/$component"
+        [[ ! -L "$checkroot" ]] || return 1
+    done
+    [[ -f "$checkroot" ]]
+}
+transaction_hash() { sha256sum -- "$1" | cut -d' ' -f1; }
+transaction_rollback() {
+    [[ -n "${TX_DIR:-}" && -f "$TX_DIR/committed" ]] || return 0
+    local path before after failed=false
+    while IFS=$'\t' read -r path before after; do
+        [[ -n "$path" ]] || continue
+        if transaction_target_safe "$path" &&
+           [[ "$(transaction_hash "$PVE_MODs_ROOT/$path")" == "$after" ]]; then
+            transaction_replace "$TX_DIR/before/$path" "$PVE_MODs_ROOT/$path" || failed=true
+        elif transaction_target_safe "$path" && [[ "$(transaction_hash "$PVE_MODs_ROOT/$path")" == "$before" ]]; then
+            :
+        else
+            echo "[pve-mods] recovery conflict: $path; journal $TX_DIR" >&2
+            failed=true
+        fi
+    done < "$TX_DIR/committed"
+    [[ "$failed" == false ]] || return 1
+    rm -rf -- "$TX_DIR"
+    TX_DIR=''
+}
+transaction_replace() {
+    local source="$1" target="$2" tmp
+    tmp=$(mktemp "${target}.pve-mods.XXXXXX") || return 1
+    if ! cp --preserve=all -- "$source" "$tmp" || ! mv -fT -- "$tmp" "$target"; then
+        rm -f -- "$tmp"; return 1
+    fi
+}
+transaction_patchset() {
+    local direction="$1"; shift
+    TRANSACTION_CHANGED=false
+    TRANSACTION_REASON="patch input, validation or write failure; see operation log"
+    local state="${PVE_MODs_STATE_DIR:-${PVE_MODs_ROOT%/}/var/lib/pve-mods}/transactions"
+    mkdir -p "$state" || return 1
+    # A prior interrupted transaction must be reviewed; never restore an old
+    # package's bytes automatically after an unrelated vendor upgrade.
+    local old
+    for old in "$state"/txn.*; do
+        [[ -d "$old" ]] || continue
+        TRANSACTION_REASON="unresolved transaction $old; manual review required"
+        echo "[pve-mods] unresolved transaction $old; manual review required" >&2
+        return 1
+    done
+    TX_DIR=$(mktemp -d "$state/txn.XXXXXX") || return 1
+    mkdir -p "$TX_DIR/before" "$TX_DIR/after"
+    local pf path component target checkroot
+    local -a paths=() options=()
+    [[ "$direction" == reverse ]] && options=(-R)
+    # Only modifications of existing regular files are supported. Header paths
+    # must agree and contain no whitespace, traversal or redirected parents.
+    for pf in "$@"; do
+        while read -r path; do
+            [[ "$path" =~ ^[a-zA-Z0-9_./+-]+$ && "$path" != /* && "/$path/" != */../* && "/$path/" != */./* ]] || { rm -rf "$TX_DIR"; return 1; }
+            target="$PVE_MODs_ROOT/$path"
+            checkroot="$PVE_MODs_ROOT"
+            IFS=/ read -ra components <<< "$path"
+            for component in "${components[@]}"; do
+                checkroot="$checkroot/$component"
+                [[ ! -L "$checkroot" ]] || { rm -rf "$TX_DIR"; return 1; }
+            done
+            [[ -f "$target" ]] || { rm -rf "$TX_DIR"; return 1; }
+            [[ -f "$TX_DIR/before/$path" ]] && continue
+            paths+=("$path")
+            mkdir -p "$TX_DIR/before/$(dirname "$path")" "$TX_DIR/after/$(dirname "$path")"
+            cp -a -- "$target" "$TX_DIR/before/$path" && cp -a -- "$target" "$TX_DIR/after/$path" || { rm -rf "$TX_DIR"; return 1; }
+        done < <(awk '/^--- / {old=$2} /^\+\+\+ / {if (old != "a/" substr($2,3) || $2 !~ /^b\//) print "INVALID"; else print substr($2,3)}' "$pf")
+    done
+    local -a patchset=("$@") inverse=()
+    local complete=true index
+    [[ "$direction" == apply ]] && inverse=(-R)
+    cp -a "$TX_DIR/after" "$TX_DIR/probe" || { rm -rf "$TX_DIR"; return 1; }
+    for ((index=${#patchset[@]}-1; index>=0; index--)); do
+        if ! patch "${inverse[@]}" -p1 -F0 -f -s --no-backup-if-mismatch -d "$TX_DIR/probe" < "${patchset[$index]}" >/dev/null 2>&1; then
+            complete=false; break
+        fi
+    done
+    rm -rf "$TX_DIR/probe"
+    for pf in "$@"; do
+        [[ "$complete" == true ]] && break
+        if patch "${options[@]}" -p1 -F0 -f --dry-run -s -d "$TX_DIR/after" < "$pf" >/dev/null 2>&1; then
+            if ! patch "${options[@]}" -p1 -F0 -f -s --no-backup-if-mismatch -d "$TX_DIR/after" < "$pf"; then
+                rm -rf "$TX_DIR"; return 1
+            fi
+        elif patch $([[ "$direction" == apply ]] && echo -R) -p1 -F0 -f --dry-run -s -d "$TX_DIR/after" < "$pf" >/dev/null 2>&1; then
+            : # Already in the requested state.
+        else
+            TRANSACTION_REASON="incompatible or partial patch: $(basename "$pf"); held unchanged"
+            echo "[pve-mods] incompatible or partial patch: $pf; held unchanged" >&2
+            if declare -F report_patch_failure >/dev/null; then
+                if [[ "$direction" == reverse ]]; then report_patch_failure "$pf" reverse; else report_patch_failure "$pf"; fi
+            fi
+            rm -rf "$TX_DIR"; return 1
+        fi
+    done
+    for path in "${paths[@]}"; do
+        cmp -s "$TX_DIR/before/$path" "$TX_DIR/after/$path" && continue
+        if [[ "$path" == *.js ]]; then
+            if command -v node >/dev/null; then
+                node --check "$TX_DIR/after/$path" >/dev/null || { rm -rf "$TX_DIR"; return 1; }
+            elif [[ "${PVE_MODs_AUTOMATIC:-0}" == 1 ]]; then
+                TRANSACTION_REASON='node syntax validator unavailable'
+                echo '[pve-mods] automatic patch held: node syntax validator unavailable' >&2
+                rm -rf "$TX_DIR"; return 1
+            fi
+        fi
+        if [[ "$path" == *.pm && "${PVE_MODs_AUTOMATIC:-0}" == 1 ]]; then
+            # perl -c executes BEGIN blocks and needs matching PVE libraries.
+            # A trusted host-specific validator must explicitly opt in.
+            if [[ -z "${PVE_MODs_VALIDATOR:-}" ]] || ! "$PVE_MODs_VALIDATOR" "$TX_DIR/after" "$path"; then
+                TRANSACTION_REASON='matching Perl validation unavailable or failed'
+                echo '[pve-mods] automatic patch held: matching Perl validation unavailable or failed' >&2
+                rm -rf "$TX_DIR"; return 1
+            fi
+        fi
+    done
+    if [[ "${PVE_MODs_CHECK_ONLY:-0}" == 1 ]]; then
+        echo '[pve-mods] staged patchset validated; check only, no activation'
+        rm -rf "$TX_DIR"
+        TX_DIR=''
+        return 0
+    fi
+    # Flush snapshots before recording any write intent.
+    sync -f "$TX_DIR" || { rm -rf "$TX_DIR"; return 1; }
+    : > "$TX_DIR/committed"
+    local before after
+    for path in "${paths[@]}"; do
+        before=$(transaction_hash "$TX_DIR/before/$path")
+        after=$(transaction_hash "$TX_DIR/after/$path")
+        [[ "$before" != "$after" ]] || continue
+        if ! transaction_target_safe "$path" || [[ "$(transaction_hash "$PVE_MODs_ROOT/$path")" != "$before" ]]; then
+            transaction_rollback; return 1
+        fi
+        # Journal intent before rename so interruption is detectable/recoverable.
+        printf '%s\t%s\t%s\n' "$path" "$before" "$after" >> "$TX_DIR/committed"
+        sync -f "$TX_DIR/committed" || { transaction_rollback; return 1; }
+        if ! transaction_replace "$TX_DIR/after/$path" "$PVE_MODs_ROOT/$path"; then
+            transaction_rollback; return 1
+        fi
+        TRANSACTION_CHANGED=true
+    done
+    return 0
+}
+transaction_finish() {
+    [[ -n "${TX_DIR:-}" ]] && rm -rf -- "$TX_DIR"
+    TX_DIR=''
+}

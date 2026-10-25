@@ -1,32 +1,14 @@
 #!/usr/bin/env bash
-# /usr/lib/pve-mods/apply-patches.sh
-#
-# Generic patch applier for pve-mods.
-#
-# Reads /etc/pve-mods/pve-mods.conf [modules] to learn which mods are enabled,
-# then applies each enabled mod's patches from /usr/lib/pve-mods/patches/<mod>/.
-#
-# Patch convention: every .patch uses a/<path> b/<path> headers and is applied
-# with `patch -p1 -F0 -d /` (zero fuzz: line offsets tolerated, fuzzy context
-# matching disabled). Each mod folder contains a 'patches.list' manifest and
-# optional 'post-apply.sh' / 'post-revert.sh' hooks.
-#
-# Per-mod atomicity: before applying, every active patch of a mod is dry-run.
-# If any one cannot be applied (or is already partially/broken-applied), the
-# whole mod is reverted to a clean state and reported as failed - a mod is
-# never left half-applied.
-#
-# Idempotent: a patch that is already applied is detected (reverse dry-run) and
-# skipped, so this script is safe to run repeatedly (e.g. from the dpkg trigger
-# after a pve-manager upgrade).
-#
-# Hook exit-code convention: a hook returns 0 (no change), 100 (made a change,
-# triggers a pveproxy restart), or any other code (error).
+# Manifest-driven text patches are staged sequentially and committed using
+# patch-transaction.sh. Unknown inputs are held unchanged. Module hooks have
+# their own side effects and are not covered by the text-file journal.
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/patch-diagnostics.sh"
+source "$SCRIPT_DIR/patch-transaction.sh"
+transaction_lock || exit 1
 
 # Root paths (overridable via environment, mainly for testing).
 PVE_MODs_ROOT="${PVE_MODs_ROOT:-/}"
@@ -74,14 +56,6 @@ list_modules() {
     ' "$MAIN_CONF"
 }
 
-# Patch-state helpers (all use zero fuzz for deterministic detection).
-_dry_forward() { patch -p1 -F0 -f --dry-run -s -d "$PVE_MODs_ROOT" < "$1" >/dev/null 2>&1; }
-_dry_reverse() { patch -R -p1 -F0 -f --dry-run -s -d "$PVE_MODs_ROOT" < "$1" >/dev/null 2>&1; }
-is_applied()   { _dry_reverse "$1"; }
-can_apply()    { _dry_forward "$1"; }
-do_apply()     { patch -p1 -F0 -f -s -d "$PVE_MODs_ROOT" < "$1"; }
-do_revert()    { patch -R -p1 -F0 -f -s -d "$PVE_MODs_ROOT" < "$1"; }
-
 CHANGED=false
 FAILED=false
 
@@ -108,6 +82,7 @@ fi
 mapfile -t _all_modules < <(list_modules)
 _target_modules=("${@:-${_all_modules[@]}}")
 for mod in "${_target_modules[@]}"; do
+    [[ "$mod" =~ ^[a-zA-Z0-9_-]+$ ]] || { FAILED=true; continue; }
     # When modules are explicitly named as args, the caller decides what to apply.
     # When running for all modules (no args from dpkg trigger), respect the config.
     if [[ $# -eq 0 ]]; then
@@ -120,6 +95,7 @@ for mod in "${_target_modules[@]}"; do
 
     if [[ ! -f "$manifest" ]]; then
         warn "No patch manifest for enabled mod '$mod' ($manifest); skipping."
+        transaction_status "$mod" blocked "patch manifest missing" || true
         FAILED=true
         continue
     fi
@@ -163,68 +139,49 @@ for mod in "${_target_modules[@]}"; do
         active+=("$patch_file")
     done < "$manifest"
 
-    # Preflight dry-run: every active patch must be already applied or cleanly
-    # appliable. Otherwise the mod cannot be installed atomically.
-    to_apply=()
-    if [[ "$preflight_ok" == "true" ]]; then
-        for pf in "${active[@]}"; do
-            if is_applied "$pf"; then
-                info "  already applied $(basename "$pf")"
-                continue
-            elif can_apply "$pf"; then
-                to_apply+=("$pf")
-            else
-                warn "  $(basename "$pf") does not apply cleanly"
-                report_patch_failure "$pf"
-                preflight_ok=false
-                break
-            fi
-        done
-    fi
-
-    # If preflight failed, revert the whole mod back to a clean state so it is
-    # never left half-applied.
-    if [[ "$preflight_ok" != "true" ]]; then
-        warn "Mod '$mod': preflight failed - reverting mod to clean state."
-        for (( i=${#active[@]}-1 ; i>=0 ; i-- )); do
-            pf="${active[$i]}"
-            if is_applied "$pf"; then
-                do_revert "$pf" && { info "  reverted $(basename "$pf")"; CHANGED=true; }
-            fi
-        done
-        run_hook "$mod_dir/post-revert.sh" "$mod_conf"
+    # Build the complete ordered result away from the live tree. Unknown or
+    # partially applied inputs are held unchanged, including existing hooks.
+    if [[ "$preflight_ok" != true ]] || ! transaction_patchset apply "${active[@]}"; then
+        warn "Mod '$mod': held unchanged; patch transaction failed."
+        status=blocked
+        [[ "${TRANSACTION_REASON:-}" == unresolved* ]] && status=recovery-required
+        transaction_status "$mod" "$status" "${TRANSACTION_REASON:-manifest preflight failed}" || true
         FAILED=true
         continue
     fi
+    [[ "$TRANSACTION_CHANGED" == true ]] && CHANGED=true
 
-    # Apply the outstanding patches.
-    if [[ ${#to_apply[@]} -gt 0 ]]; then
-        for pf in "${to_apply[@]}"; do
-            do_apply "$pf" && { info "  applied $(basename "$pf")"; CHANGED=true; }
-        done
-    else
-        info "  already up to date"
-    fi
+    if [[ "${PVE_MODs_CHECK_ONLY:-0}" == 1 ]]; then continue; fi
 
     # Run the post-apply hook. If it errors, roll the mod back so it is never
     # left half-applied (matches the preflight atomicity contract).
     if ! run_hook "$mod_dir/post-apply.sh" "$mod_conf"; then
         warn "Mod '$mod': post-apply hook failed - reverting mod to clean state."
         run_hook "$mod_dir/post-revert.sh" "$mod_conf"
-        for (( i=${#active[@]}-1 ; i>=0 ; i-- )); do
-            pf="${active[$i]}"
-            if is_applied "$pf"; then
-                do_revert "$pf" && { info "  reverted $(basename "$pf")"; CHANGED=true; }
-            fi
-        done
+        if ! transaction_rollback; then
+            warn "Recovery required: refusing to overwrite files changed since commit."
+            transaction_status "$mod" recovery-required "post-apply failed; rollback conflicts require manual review" || true
+        fi
+        if [[ -z "${TX_DIR:-}" ]]; then
+            transaction_status "$mod" error "post-apply hook failed; text changes restored" || true
+        fi
         FAILED=true
         continue
     fi
+    transaction_status "$mod" active "patches staged and committed; runtime health not assessed" || true
+    transaction_finish
+
 done
 
 if [[ "$CHANGED" == "true" ]]; then
     info "Restarting pveproxy..."
-    systemctl restart pveproxy 2>/dev/null || true
+    if ! systemctl restart pveproxy; then
+        warn "pveproxy restart failed"
+        for mod in "${_target_modules[@]}"; do
+            transaction_status "$mod" error "pveproxy restart failed; inspect service health" || true
+        done
+        FAILED=true
+    fi
 fi
 
 [[ "$FAILED" == "true" ]] && exit 1

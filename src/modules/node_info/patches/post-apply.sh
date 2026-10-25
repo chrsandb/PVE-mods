@@ -6,7 +6,7 @@
 
 set -u
 
-GPU_RRD_DIR="/var/lib/rrdcached/db/pve-mods-gpu"
+GPU_RRD_DIR="${PVE_MODs_ROOT:-}/var/lib/rrdcached/db/pve-mods-gpu"
 
 read_conf() {
     local file="$1" section="$2" key="$3" default="${4:-0}"
@@ -25,8 +25,8 @@ read_conf() {
 gpu_history="$(read_conf "${MOD_CONF:-/etc/pve-mods/conf.d/node_info.conf}" gpu gpu_history 0)"
 
 if [[ "$gpu_history" == "1" && ! -d "$GPU_RRD_DIR" ]]; then
-    mkdir -p "$GPU_RRD_DIR"
-    chown www-data:www-data "$GPU_RRD_DIR" 2>/dev/null || true
+    mkdir -p "$GPU_RRD_DIR" || exit 1
+    chown www-data:www-data "$GPU_RRD_DIR" || exit 1
     echo "[pve-mods] Created GPU RRD directory: $GPU_RRD_DIR"
     exit 100
 fi

@@ -1,23 +1,14 @@
 #!/usr/bin/env bash
-# /usr/lib/pve-mods/revert-patches.sh
-#
-# Generic patch reverter for pve-mods.
-#
-# Reverses every patch found under /usr/lib/pve-mods/patches/<mod>/ (regardless
-# of whether the mod is currently enabled), using `patch -R -p1 -F0 -d /`.
-# Patches are reverted in reverse manifest order. Patched text files need no
-# backups - `patch -R` restores them exactly. Non-patch actions (e.g. the
-# nag-screen min.js symlink) are undone by each mod's 'post-revert.sh' hook.
-#
-# Called by prerm before the package's files are removed.
-#
-# Hook exit-code convention: a hook returns 0 (no change), 100 (made a change,
-# triggers a pveproxy restart), or any other code (error).
+# Manifest-driven text patches are staged sequentially and committed using
+# patch-transaction.sh. Unknown inputs are held unchanged. Module hooks have
+# their own side effects and are not covered by the text-file journal.
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/patch-diagnostics.sh"
+source "$SCRIPT_DIR/patch-transaction.sh"
+transaction_lock || exit 1
 
 # Root paths (overridable via environment, mainly for testing).
 PVE_MODs_ROOT="${PVE_MODs_ROOT:-/}"
@@ -28,22 +19,6 @@ STASH_DIR="${PVE_MODs_STASH_DIR:-/var/lib/pve-mods/backup}"
 
 info() { echo "[pve-mods] $*"; }
 warn() { echo "[pve-mods] WARNING: $*" >&2; }
-
-# Revert a single patch. Returns 0 if a change was made, 1 otherwise.
-revert_one_patch() {
-    local patch="$1"
-    # Not applied? (a clean forward apply means the change is absent)
-    if patch -p1 -F0 -d "$PVE_MODs_ROOT" -f --dry-run -s < "$patch" >/dev/null 2>&1; then
-        return 1
-    fi
-    if patch -R -p1 -F0 -d "$PVE_MODs_ROOT" -f --dry-run -s < "$patch" >/dev/null 2>&1; then
-        patch -R -p1 -F0 -d "$PVE_MODs_ROOT" -f -s < "$patch"
-        return 0
-    fi
-    warn "  $(basename "$patch") could not be reverted cleanly; manual cleanup may be needed"
-    report_patch_failure "$patch" reverse
-    return 2
-}
 
 # ── main ──────────────────────────────────────────────────────────────────────
 if ! command -v patch >/dev/null 2>&1; then
@@ -59,23 +34,11 @@ FAILED=false
 mapfile -t _all_modules < <(for d in "$PATCHES_DIR"/*/; do [[ -d "$d" ]] && basename "$d"; done)
 _target_modules=("${@:-${_all_modules[@]}}")
 for mod in "${_target_modules[@]}"; do
+    [[ "$mod" =~ ^[a-zA-Z0-9_-]+$ ]] || { FAILED=true; continue; }
     mod_dir="$PATCHES_DIR/$mod/"
     [[ -d "$mod_dir" ]] || continue
     manifest="$mod_dir/patches.list"
     mod_conf="$CONFD_DIR/$mod.conf"
-
-    # Run the post-revert hook first (undo non-patch actions such as symlinks).
-    hook="$mod_dir/post-revert.sh"
-    if [[ -x "$hook" ]]; then
-        info "Running post-revert hook for $mod"
-        STASH_DIR="$STASH_DIR" MOD_CONF="$mod_conf" CONFD_DIR="$CONFD_DIR" "$hook"
-        rc=$?
-        case "$rc" in
-            0)   ;;
-            100) CHANGED=true ;;
-            *)   warn "post-revert hook for $mod reported an error (exit $rc)" ;;
-        esac
-    fi
 
     [[ -f "$manifest" ]] || continue
     info "Reverting mod: $mod"
@@ -91,24 +54,40 @@ for mod in "${_target_modules[@]}"; do
         done < "$manifest"
     )
 
+    ordered=()
     for (( i=${#patches[@]}-1 ; i>=0 ; i-- )); do
-        patch_name="${patches[$i]}"
-        patch_file="$mod_dir/$patch_name"
-        [[ -f "$patch_file" ]] || continue
-        revert_one_patch "$patch_file"
-        rc=$?
-        if [[ "$rc" -eq 0 ]]; then
-            info "  reverted $patch_name"
-            CHANGED=true
-        elif [[ "$rc" -eq 2 ]]; then
-            FAILED=true
-        fi
+        patch_file="$mod_dir/${patches[$i]}"
+        [[ -f "$patch_file" ]] || { FAILED=true; continue; }
+        ordered+=("$patch_file")
     done
+    if ! transaction_patchset reverse "${ordered[@]}"; then
+        transaction_status "$mod" blocked "${TRANSACTION_REASON:-revert failed}" || true
+        FAILED=true
+        continue
+    fi
+    [[ "$TRANSACTION_CHANGED" == true ]] && CHANGED=true
+    # Run the post-revert hook first (undo non-patch actions such as symlinks).
+    hook="$mod_dir/post-revert.sh"
+    if [[ -x "$hook" ]]; then
+        info "Running post-revert hook for $mod"
+        STASH_DIR="$STASH_DIR" MOD_CONF="$mod_conf" CONFD_DIR="$CONFD_DIR" "$hook"
+        rc=$?
+        case "$rc" in
+            0)   ;;
+            100) CHANGED=true ;;
+            *)   warn "post-revert hook for $mod reported an error (exit $rc)"; FAILED=true ;;
+        esac
+    fi
+
+
+    transaction_status "$mod" inactive "patches reverted; hook or service failures may require inspection" || true
+    transaction_finish
+
 done
 
 if [[ "$CHANGED" == "true" ]]; then
     info "Restarting pveproxy..."
-    systemctl restart pveproxy 2>/dev/null || true
+    if ! systemctl restart pveproxy; then FAILED=true; fi
 fi
 
 [[ "$FAILED" == "false" ]] || exit 1
