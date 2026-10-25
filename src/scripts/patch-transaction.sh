@@ -72,7 +72,7 @@ transaction_validator() {
         [[ "$current" == / ]] && break
         current=$(dirname "$current")
     done
-    "$validator" "$1" "$2"
+    timeout --kill-after=5s "${PVE_MODs_VALIDATOR_TIMEOUT:-30s}" "$validator" "$1" "$2"
 }
 transaction_record_outputs() {
     local catalog="${PVE_MODs_STATE_DIR:-${PVE_MODs_ROOT%/}/var/lib/pve-mods}/known-outputs.tsv"
@@ -182,7 +182,7 @@ transaction_patchset() {
             if ! patch "${options[@]}" -p1 -F0 -f -s --no-backup-if-mismatch -d "$TX_DIR/after" < "$pf"; then
                 rm -rf "$TX_DIR"; return 1
             fi
-        elif patch $([[ "$direction" == apply ]] && echo -R) -p1 -F0 -f --dry-run -s -d "$TX_DIR/after" < "$pf" >/dev/null 2>&1; then
+        elif patch "${inverse[@]}" -p1 -F0 -f --dry-run -s -d "$TX_DIR/after" < "$pf" >/dev/null 2>&1; then
             : # Already in the requested state.
         else
             TRANSACTION_REASON="incompatible or partial patch: $(basename "$pf"); held unchanged"

@@ -79,6 +79,13 @@ if PATH="$TMP/bin:$PATH" transaction_patchset apply "$TMP/good.patch" "$TMP/seco
 [[ $TRANSACTION_REASON == 'live input changed during staging:'* ]]
 grep -q 'temperature = 1' "$file"
 [[ $(cat "$PVE_MODs_ROOT/usr/share/demo/second.js") == 'external writer' ]]
+# Known vendor Perl input must reach the validation gate, not just the trust gate.
+cp "$file" "$PVE_MODs_ROOT/usr/share/demo/file.pm"
+sed 's@demo/file.js@demo/file.pm@g' "$TMP/good.patch" > "$TMP/perl.patch"
+printf '/usr/share/demo/file.pm\n' >> "$PVE_MODs_DPKG_DIR/info/demo.list"
+printf '%s  usr/share/demo/file.pm\n' "$(md5sum "$PVE_MODs_ROOT/usr/share/demo/file.pm" | cut -d' ' -f1)" >> "$PVE_MODs_DPKG_DIR/info/demo.md5sums"
+if PVE_MODs_AUTOMATIC=1 transaction_patchset apply "$TMP/perl.patch"; then exit 1; fi
+[[ $TRANSACTION_REASON == 'trusted /etc/pve-mods/validator unavailable'* ]]
 # Persistent validator lookup checks root ownership and writable ancestors.
 mkdir -p "$PVE_MODs_ROOT/etc/pve-mods"
 printf '#!/bin/bash\nprintf "%%s\\n" "$@" > "$PVE_MODs_ROOT/validator-args"\n' > "$PVE_MODs_ROOT/etc/pve-mods/validator"
@@ -94,6 +101,9 @@ chmod +x "$TMP/bin/stat"
 PATH="$TMP/bin:$PATH" transaction_validator "$TMP/staged" usr/share/demo/file.pm
 [[ $(head -1 "$PVE_MODs_ROOT/validator-args") == "$TMP/staged" ]]
 [[ $(tail -1 "$PVE_MODs_ROOT/validator-args") == usr/share/demo/file.pm ]]
+# A trusted but hung validator is bounded; no live file is activated.
+printf '#!/bin/bash\nsleep 10\n' > "$PVE_MODs_ROOT/etc/pve-mods/validator"
+if PATH="$TMP/bin:$PATH" PVE_MODs_VALIDATOR_TIMEOUT=0.1s transaction_validator "$TMP/staged" usr/share/demo/file.pm; then exit 1; fi
 # A process killed after rename leaves its journal; the next run holds it.
 if PVE_MODs_STATE_DIR="$TMP/interrupted" bash -c '
     source "$1"

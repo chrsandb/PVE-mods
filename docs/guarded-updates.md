@@ -29,7 +29,9 @@ each changed `.pm` target as:
 ```
 
 Exit 0 means the assembled target passed the administrator's validation;
-any other exit status holds the module. Output goes to the operation log.
+any other exit status holds the module. Validation is limited to 30 seconds
+(with a five-second termination grace); `PVE_MODs_VALIDATOR_TIMEOUT` can override
+the limit for explicitly managed invocations. Output goes to the operation log.
 The hook runs with the patcher's privileges. It must leave the live host and
 staging tree unchanged. `PVE_MODs_VALIDATOR=/absolute/path` overrides this location
 for explicitly managed invocations and has the same ownership requirements.
