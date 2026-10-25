@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Small management CLI; all patch mutations remain owned by the package engine."""
+import argparse
+import configparser
+import fcntl
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def atomic_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.pve-mods-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, path.stat().st_mode & 0o777 if path.exists() else 0o644)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('status', help='Last operation status, not a live integrity check').add_argument('--json', action='store_true')
+    for command in ('check', 'apply', 'revert'):
+        command_parser = commands.add_parser(command)
+        if command != 'revert':
+            command_parser.add_argument('--automatic', action='store_true', help='Require unattended validation')
+        command_parser.add_argument('modules', nargs='*')
+    configure = commands.add_parser('configure', help='Enable node_info only; does not apply patches')
+    configure.add_argument('--node-info', action='store_true', required=True)
+    configure.add_argument('--auto', choices=('off', 'guarded'), required=True)
+    args = parser.parse_args()
+    root = Path(os.environ.get('PVE_MODs_ROOT', '/'))
+    state = Path(os.environ.get('PVE_MODs_STATE_DIR', str(root / 'var/lib/pve-mods')))
+    config = Path(os.environ.get('PVE_MODs_MAIN_CONF', str(root / 'etc/pve-mods/pve-mods.conf')))
+    scripts = Path(os.environ.get('PVE_MODs_SCRIPTS_DIR', '/usr/lib/pve-mods'))
+    if args.command == 'status':
+        records = []
+        for path in sorted((state / 'status').glob('*.json')):
+            records.append(json.loads(path.read_text()))
+        pending = sorted(path.name for path in (state / 'transactions').glob('txn.*') if path.is_dir())
+        result = {'last_operations': records, 'pending_transactions': pending}
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print('Last recorded operations (use check for current compatibility):')
+            for record in records:
+                print(f"{record['module']}: {record['state']} — {record['reason']} ({record['timestamp']})")
+            if not records:
+                print('No operation recorded.')
+            if pending:
+                print('Recovery journals: ' + ', '.join(pending))
+        return 0
+    if os.geteuid() != 0 and root == Path('/'):
+        parser.error('Run mutations/check as root on the host')
+    if args.command == 'configure':
+        lock_path = Path(os.environ.get('PVE_MODs_LOCK_FILE', str(state / 'lifecycle.lock')))
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open('a') as lock:
+            deadline = time.monotonic() + float(os.environ.get('PVE_MODs_LOCK_TIMEOUT', '30'))
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        parser.error('Lifecycle operation busy; configuration unchanged')
+                    time.sleep(0.1)
+            if config.is_symlink():
+                parser.error('Refusing symlinked configuration')
+            text = config.read_text()
+            values = configparser.ConfigParser(interpolation=None)
+            values.read_string(text)
+            if values.get('modules', 'nag_screen', fallback='0').strip() != '0':
+                parser.error('nag_screen already enabled; refusing to change unrelated configuration')
+            lines = text.splitlines(keepends=True)
+            changes = {('modules', 'node_info'): '1', ('pve_trigger', 'enabled'): '1' if args.auto == 'guarded' else '0'}
+            section = ''
+            for index, line in enumerate(lines):
+                stripped = line.strip()
+                if stripped.startswith('[') and stripped.endswith(']'):
+                    section = stripped[1:-1]
+                elif '=' in line and not stripped.startswith(('#', ';')):
+                    key = line.split('=', 1)[0].strip()
+                    if (section, key) in changes:
+                        lines[index] = key + '=' + changes.pop((section, key)) + '\n'
+            # Existing supported package config must have both keys; don't invent sections.
+            if changes:
+                parser.error('Required config keys missing; update the package configuration first')
+            atomic_write(config, ''.join(lines))
+        print('node_info enabled; automatic reconciliation ' + args.auto + '. Run pve-mods check --automatic before apply.')
+        return 0
+    for module in args.modules:
+        if not module.replace('_', '').isalnum() or module.startswith('-'):
+            parser.error('Invalid module name')
+    env = os.environ.copy()
+    if args.command == 'check':
+        env['PVE_MODs_CHECK_ONLY'] = '1'
+    if getattr(args, 'automatic', False):
+        env['PVE_MODs_AUTOMATIC'] = '1'
+    helper = 'revert-patches.sh' if args.command == 'revert' else 'apply-patches.sh'
+    return subprocess.call([str(scripts / helper), *args.modules], env=env)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, configparser.Error) as error:
+        print(f'pve-mods: {error}', file=sys.stderr)
+        sys.exit(1)
