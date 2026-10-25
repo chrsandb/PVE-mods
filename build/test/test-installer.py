@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -48,7 +49,7 @@ https://*) url="$1"; shift;;
 done
 case "$url" in
 https://api.github.com/*) cp "$FIXTURE/metadata" "$dest";;
-*/SHA256SUMS.asc) printf signature > "$dest";;
+*/SHA256SUMS.asc) if [[ -f "$FIXTURE/signature" ]]; then cp "$FIXTURE/signature" "$dest"; else printf signature > "$dest"; fi;;
 */SHA256SUMS) cp "$FIXTURE/sums" "$dest";;
 *.deb) cp "$FIXTURE/package" "$dest";;
 *) exit 22;; esac''')
@@ -76,6 +77,21 @@ https://api.github.com/*) cp "$FIXTURE/metadata" "$dest";;
         result = self.signed('--version', 'v2.2.0')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len((self.root / 'installed').read_text().splitlines()), 1)
+
+    @unittest.skipUnless(shutil.which('gpg') and shutil.which('gpgv'), 'GnuPG required')
+    def test_real_detached_signature_roundtrip(self):
+        home = self.root / 'gnupg'
+        home.mkdir(mode=0o700)
+        gpg = ['gpg', '--homedir', str(home), '--batch', '--pinentry-mode', 'loopback', '--passphrase', '']
+        subprocess.run([*gpg, '--quick-generate-key', 'Installer fixture <fixture@example.invalid>', 'ed25519', 'sign', '0'], check=True, capture_output=True)
+        keys = subprocess.run([*gpg, '--with-colons', '--list-keys'], check=True, capture_output=True, text=True).stdout
+        fingerprint = next(line.split(':')[9] for line in keys.splitlines() if line.startswith('fpr:'))
+        with (self.root / 'keyring').open('wb') as stream:
+            subprocess.run([*gpg, '--export', fingerprint], stdout=stream, check=True)
+        subprocess.run([*gpg, '--detach-sign', '--output', str(self.root / 'signature'), str(self.root / 'sums')], check=True, capture_output=True)
+        (self.bin / 'gpgv').unlink()
+        result = self.run_install('--yes', '--keyring', str(self.root / 'keyring'), '--signing-fingerprint', fingerprint)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unattended_requires_signature_trust(self):
         self.assert_refused(self.run_install('--yes'))
