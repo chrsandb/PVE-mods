@@ -35,6 +35,62 @@ transaction_target_safe() {
     [[ -f "$checkroot" ]]
 }
 transaction_hash() { sha256sum -- "$1" | cut -d' ' -f1; }
+# Installed dpkg metadata is the trust anchor for automatic inputs. This proves
+# local package identity/integrity, not compatibility with every package release.
+transaction_vendor_identity() {
+    local path="$1" db="${PVE_MODs_DPKG_DIR:-${PVE_MODs_ROOT%/}/var/lib/dpkg}" owner
+    owner=$(dpkg-query --admindir="$db" -S "/$path" 2>/dev/null) || return 1
+    [[ "$owner" == *": /$path" && "$owner" != *$'\n'* ]] || return 1
+    TX_PACKAGE="${owner%: /$path}"
+    [[ "$TX_PACKAGE" =~ ^[a-z0-9][a-z0-9+.:~-]*$ ]] || return 1
+    TX_VERSION=$(dpkg-query --admindir="$db" -W -f='${Version}' "$TX_PACKAGE" 2>/dev/null) || return 1
+    [[ -n "$TX_VERSION" ]] || return 1
+    TX_VENDOR_MD5=$(awk -v path="$path" '$2 == path {print $1}' "$db/info/$TX_PACKAGE.md5sums" 2>/dev/null) || return 1
+    [[ "$TX_VENDOR_MD5" =~ ^[a-f0-9]{32}$ ]]
+}
+transaction_known_input() {
+    local path="$1" snapshot="$2" catalog="$3" sha
+    transaction_vendor_identity "$path" || return 1
+    if [[ "$(md5sum -- "$snapshot" | cut -d' ' -f1)" == "$TX_VENDOR_MD5" ]]; then
+        return 0
+    fi
+    sha=$(transaction_hash "$snapshot")
+    [[ -f "$catalog" ]] || return 1
+    awk -F '\t' -v p="$path" -v pkg="$TX_PACKAGE" -v ver="$TX_VERSION" -v md5="$TX_VENDOR_MD5" -v sha="$sha" \
+        '$1==p && $2==pkg && $3==ver && $4==md5 && $5==sha {found=1} END {exit !found}' "$catalog"
+}
+transaction_validator() {
+    local validator="${PVE_MODs_VALIDATOR:-${PVE_MODs_ROOT%/}/etc/pve-mods/validator}"
+    local current="$validator" mode
+    [[ "$validator" == /* && -f "$validator" && -x "$validator" ]] || return 1
+    # Validate every ancestor: a root-owned file under a writable directory
+    # could otherwise be swapped by another user before privileged execution.
+    while :; do
+        [[ ! -L "$current" && "$(stat -c %u -- "$current")" == 0 ]] || return 1
+        mode=$(stat -c %a -- "$current") || return 1
+        (( (8#$mode & 0022) == 0 )) || return 1
+        [[ "$current" == / ]] && break
+        current=$(dirname "$current")
+    done
+    "$validator" "$1" "$2"
+}
+transaction_record_outputs() {
+    local catalog="${PVE_MODs_STATE_DIR:-${PVE_MODs_ROOT%/}/var/lib/pve-mods}/known-outputs.tsv"
+    local tmp path before after
+    [[ -f "$TX_DIR/verified" ]] || return 0
+    tmp=$(mktemp "${catalog}.XXXXXX") || return 1
+    [[ ! -f "$catalog" ]] || cat "$catalog" > "$tmp" || { rm -f "$tmp"; return 1; }
+    while IFS=$'\t' read -r path before after; do
+        [[ -n "$path" ]] || continue
+        # Identity captured while staging, checked again after activation.
+        if transaction_vendor_identity "$path"; then
+            awk -F '\t' -v p="$path" -v pkg="$TX_PACKAGE" -v ver="$TX_VERSION" -v md5="$TX_VENDOR_MD5" \
+                '$1==p && $2==pkg && $3==ver && $4==md5 {found=1} END {exit !found}' "$TX_DIR/verified" || continue
+            printf '%s\t%s\t%s\t%s\t%s\n' "$path" "$TX_PACKAGE" "$TX_VERSION" "$TX_VENDOR_MD5" "$after" >> "$tmp"
+        fi
+    done < "$TX_DIR/committed"
+    sync -f "$tmp" && mv -fT "$tmp" "$catalog" && sync -f "$(dirname "$catalog")"
+}
 transaction_rollback() {
     [[ -n "${TX_DIR:-}" && -f "$TX_DIR/committed" ]] || return 0
     local path before after failed=false
@@ -51,13 +107,15 @@ transaction_rollback() {
         fi
     done < "$TX_DIR/committed"
     [[ "$failed" == false ]] || return 1
-    rm -rf -- "$TX_DIR"
+    local parent
+    parent=$(dirname "$TX_DIR")
+    rm -rf -- "$TX_DIR" && sync -f "$parent" || return 1
     TX_DIR=''
 }
 transaction_replace() {
     local source="$1" target="$2" tmp
     tmp=$(mktemp "${target}.pve-mods.XXXXXX") || return 1
-    if ! cp --preserve=all -- "$source" "$tmp" || ! mv -fT -- "$tmp" "$target"; then
+    if ! cp --preserve=all -- "$source" "$tmp" || ! sync -f "$tmp" || ! mv -fT -- "$tmp" "$target" || ! sync -f "$(dirname "$target")"; then
         rm -f -- "$tmp"; return 1
     fi
 }
@@ -79,25 +137,33 @@ transaction_patchset() {
     TX_DIR=$(mktemp -d "$state/txn.XXXXXX") || return 1
     mkdir -p "$TX_DIR/before" "$TX_DIR/after"
     local pf path component target checkroot
+    local catalog="${PVE_MODs_STATE_DIR:-${PVE_MODs_ROOT%/}/var/lib/pve-mods}/known-outputs.tsv"
     local -a paths=() options=()
     [[ "$direction" == reverse ]] && options=(-R)
     # Only modifications of existing regular files are supported. Header paths
     # must agree and contain no whitespace, traversal or redirected parents.
     for pf in "$@"; do
         while read -r path; do
-            [[ "$path" =~ ^[a-zA-Z0-9_./+-]+$ && "$path" != /* && "/$path/" != */../* && "/$path/" != */./* ]] || { rm -rf "$TX_DIR"; return 1; }
+            [[ "$path" =~ ^[a-zA-Z0-9_./+-]+$ && "$path" != /* && "/$path/" != */../* && "/$path/" != */./* ]] || { TRANSACTION_REASON="unsafe or inconsistent patch target: $path"; rm -rf "$TX_DIR"; return 1; }
             target="$PVE_MODs_ROOT/$path"
             checkroot="$PVE_MODs_ROOT"
             IFS=/ read -ra components <<< "$path"
             for component in "${components[@]}"; do
                 checkroot="$checkroot/$component"
-                [[ ! -L "$checkroot" ]] || { rm -rf "$TX_DIR"; return 1; }
+                [[ ! -L "$checkroot" ]] || { TRANSACTION_REASON="symlink target or ancestor: $path"; rm -rf "$TX_DIR"; return 1; }
             done
-            [[ -f "$target" ]] || { rm -rf "$TX_DIR"; return 1; }
+            [[ -f "$target" ]] || { TRANSACTION_REASON="patch target is not an existing regular file: $path"; rm -rf "$TX_DIR"; return 1; }
             [[ -f "$TX_DIR/before/$path" ]] && continue
             paths+=("$path")
             mkdir -p "$TX_DIR/before/$(dirname "$path")" "$TX_DIR/after/$(dirname "$path")"
             cp -a -- "$target" "$TX_DIR/before/$path" && cp -a -- "$target" "$TX_DIR/after/$path" || { rm -rf "$TX_DIR"; return 1; }
+            if transaction_known_input "$path" "$TX_DIR/before/$path" "$catalog"; then
+                printf '%s\t%s\t%s\t%s\n' "$path" "$TX_PACKAGE" "$TX_VERSION" "$TX_VENDOR_MD5" >> "$TX_DIR/verified"
+            elif [[ "${PVE_MODs_AUTOMATIC:-0}" == 1 ]]; then
+                TRANSACTION_REASON="unrecognized package input: $path (vendor checksum or recorded output required)"
+                echo "[pve-mods] automatic patch held: $TRANSACTION_REASON" >&2
+                rm -rf "$TX_DIR"; return 1
+            fi
         done < <(awk '/^--- / {old=$2} /^\+\+\+ / {if (old != "a/" substr($2,3) || $2 !~ /^b\//) print "INVALID"; else print substr($2,3)}' "$pf")
     done
     local -a patchset=("$@") inverse=()
@@ -131,7 +197,7 @@ transaction_patchset() {
         cmp -s "$TX_DIR/before/$path" "$TX_DIR/after/$path" && continue
         if [[ "$path" == *.js ]]; then
             if command -v node >/dev/null; then
-                node --check "$TX_DIR/after/$path" >/dev/null || { rm -rf "$TX_DIR"; return 1; }
+                node --check "$TX_DIR/after/$path" >/dev/null || { TRANSACTION_REASON="JavaScript syntax validation failed: $path"; rm -rf "$TX_DIR"; return 1; }
             elif [[ "${PVE_MODs_AUTOMATIC:-0}" == 1 ]]; then
                 TRANSACTION_REASON='node syntax validator unavailable'
                 echo '[pve-mods] automatic patch held: node syntax validator unavailable' >&2
@@ -141,8 +207,8 @@ transaction_patchset() {
         if [[ "$path" == *.pm && "${PVE_MODs_AUTOMATIC:-0}" == 1 ]]; then
             # perl -c executes BEGIN blocks and needs matching PVE libraries.
             # A trusted host-specific validator must explicitly opt in.
-            if [[ -z "${PVE_MODs_VALIDATOR:-}" ]] || ! "$PVE_MODs_VALIDATOR" "$TX_DIR/after" "$path"; then
-                TRANSACTION_REASON='matching Perl validation unavailable or failed'
+            if ! transaction_validator "$TX_DIR/after" "$path"; then
+                TRANSACTION_REASON='trusted /etc/pve-mods/validator unavailable or matching Perl validation failed'
                 echo '[pve-mods] automatic patch held: matching Perl validation unavailable or failed' >&2
                 rm -rf "$TX_DIR"; return 1
             fi
@@ -156,6 +222,18 @@ transaction_patchset() {
     fi
     # Flush snapshots before recording any write intent.
     sync -f "$TX_DIR" || { rm -rf "$TX_DIR"; return 1; }
+    # Check the entire group before the first write, and each target again at
+    # replacement. The lock coordinates our tools, not external package writers.
+    for path in "${paths[@]}"; do
+        if [[ "${PVE_MODs_AUTOMATIC:-0}" == 1 ]] && ! transaction_known_input "$path" "$TX_DIR/before/$path" "$catalog"; then
+            TRANSACTION_REASON="package identity changed during staging: $path"
+            rm -rf "$TX_DIR"; return 1
+        fi
+        if ! transaction_target_safe "$path" || [[ "$(transaction_hash "$PVE_MODs_ROOT/$path")" != "$(transaction_hash "$TX_DIR/before/$path")" ]]; then
+            TRANSACTION_REASON="live input changed during staging: $path"
+            rm -rf "$TX_DIR"; return 1
+        fi
+    done
     : > "$TX_DIR/committed"
     local before after
     for path in "${paths[@]}"; do
@@ -169,6 +247,7 @@ transaction_patchset() {
         printf '%s\t%s\t%s\n' "$path" "$before" "$after" >> "$TX_DIR/committed"
         sync -f "$TX_DIR/committed" || { transaction_rollback; return 1; }
         if ! transaction_replace "$TX_DIR/after/$path" "$PVE_MODs_ROOT/$path"; then
+            TRANSACTION_REASON="failed to replace or persist target: $path"
             transaction_rollback; return 1
         fi
         TRANSACTION_CHANGED=true
@@ -176,6 +255,12 @@ transaction_patchset() {
     return 0
 }
 transaction_finish() {
-    [[ -n "${TX_DIR:-}" ]] && rm -rf -- "$TX_DIR"
+    if [[ -n "${TX_DIR:-}" ]]; then
+        transaction_record_outputs || return 1
+        # Persist target renames before dropping the recovery journal.
+        sync -f "$TX_DIR" || return 1
+        rm -rf -- "$TX_DIR" || return 1
+        sync -f "$(dirname "$TX_DIR")" || return 1
+    fi
     TX_DIR=''
 }

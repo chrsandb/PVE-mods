@@ -83,6 +83,7 @@ mapfile -t _all_modules < <(list_modules)
 _target_modules=("${@:-${_all_modules[@]}}")
 for mod in "${_target_modules[@]}"; do
     [[ "$mod" =~ ^[a-zA-Z0-9_-]+$ ]] || { FAILED=true; continue; }
+    TRANSACTION_REASON="manifest preflight failed"
     # When modules are explicitly named as args, the caller decides what to apply.
     # When running for all modules (no args from dpkg trigger), respect the config.
     if [[ $# -eq 0 ]]; then
@@ -149,6 +150,7 @@ for mod in "${_target_modules[@]}"; do
         FAILED=true
         continue
     fi
+    prior_changed="$CHANGED"
     [[ "$TRANSACTION_CHANGED" == true ]] && CHANGED=true
 
     if [[ "${PVE_MODs_CHECK_ONLY:-0}" == 1 ]]; then continue; fi
@@ -158,7 +160,9 @@ for mod in "${_target_modules[@]}"; do
     if ! run_hook "$mod_dir/post-apply.sh" "$mod_conf"; then
         warn "Mod '$mod': post-apply hook failed - reverting mod to clean state."
         run_hook "$mod_dir/post-revert.sh" "$mod_conf"
-        if ! transaction_rollback; then
+        if transaction_rollback; then
+            CHANGED="$prior_changed"
+        else
             warn "Recovery required: refusing to overwrite files changed since commit."
             transaction_status "$mod" recovery-required "post-apply failed; rollback conflicts require manual review" || true
         fi
@@ -168,8 +172,12 @@ for mod in "${_target_modules[@]}"; do
         FAILED=true
         continue
     fi
-    transaction_status "$mod" active "patches staged and committed; runtime health not assessed" || true
-    transaction_finish
+    if ! transaction_finish; then
+        transaction_status "$mod" recovery-required "could not persist transaction completion; inspect journal" || true
+        FAILED=true
+        continue
+    fi
+    transaction_status "$mod" active "patches staged and committed; runtime health not assessed" || FAILED=true
 
 done
 

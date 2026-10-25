@@ -23,7 +23,7 @@ warn() { echo "[pve-mods] WARNING: $*" >&2; }
 # ── main ──────────────────────────────────────────────────────────────────────
 if ! command -v patch >/dev/null 2>&1; then
     warn "'patch' command not found; cannot revert mods."
-    exit 0
+    exit 1
 fi
 
 [[ -d "$PATCHES_DIR" ]] || exit 0
@@ -35,12 +35,17 @@ mapfile -t _all_modules < <(for d in "$PATCHES_DIR"/*/; do [[ -d "$d" ]] && base
 _target_modules=("${@:-${_all_modules[@]}}")
 for mod in "${_target_modules[@]}"; do
     [[ "$mod" =~ ^[a-zA-Z0-9_-]+$ ]] || { FAILED=true; continue; }
+    TRANSACTION_REASON="revert manifest preflight failed"
     mod_dir="$PATCHES_DIR/$mod/"
     [[ -d "$mod_dir" ]] || continue
     manifest="$mod_dir/patches.list"
     mod_conf="$CONFD_DIR/$mod.conf"
 
-    [[ -f "$manifest" ]] || continue
+    if [[ ! -f "$manifest" ]]; then
+        transaction_status "$mod" blocked "revert manifest missing" || true
+        FAILED=true
+        continue
+    fi
     info "Reverting mod: $mod"
 
     # Collect patch names (ignore conditions and comments), then reverse order.
@@ -55,18 +60,25 @@ for mod in "${_target_modules[@]}"; do
     )
 
     ordered=()
+    preflight_ok=true
     for (( i=${#patches[@]}-1 ; i>=0 ; i-- )); do
         patch_file="$mod_dir/${patches[$i]}"
-        [[ -f "$patch_file" ]] || { FAILED=true; continue; }
+        [[ -f "$patch_file" ]] || { preflight_ok=false; continue; }
         ordered+=("$patch_file")
     done
+    if [[ "$preflight_ok" != true ]]; then
+        transaction_status "$mod" blocked "revert patch file missing; whole module held" || true
+        FAILED=true
+        continue
+    fi
     if ! transaction_patchset reverse "${ordered[@]}"; then
         transaction_status "$mod" blocked "${TRANSACTION_REASON:-revert failed}" || true
         FAILED=true
         continue
     fi
     [[ "$TRANSACTION_CHANGED" == true ]] && CHANGED=true
-    # Run the post-revert hook first (undo non-patch actions such as symlinks).
+    # Undo non-patch actions after successful staged text reversion.
+    hook_failed=false
     hook="$mod_dir/post-revert.sh"
     if [[ -x "$hook" ]]; then
         info "Running post-revert hook for $mod"
@@ -75,19 +87,30 @@ for mod in "${_target_modules[@]}"; do
         case "$rc" in
             0)   ;;
             100) CHANGED=true ;;
-            *)   warn "post-revert hook for $mod reported an error (exit $rc)"; FAILED=true ;;
+            *)   warn "post-revert hook for $mod reported an error (exit $rc)"; FAILED=true; hook_failed=true ;;
         esac
     fi
 
 
-    transaction_status "$mod" inactive "patches reverted; hook or service failures may require inspection" || true
-    transaction_finish
+    if ! transaction_finish; then
+        transaction_status "$mod" recovery-required "could not persist revert completion; inspect journal" || true
+        FAILED=true
+    elif [[ "$hook_failed" == true ]]; then
+        transaction_status "$mod" error "text reverted, but post-revert hook failed" || true
+    else
+        transaction_status "$mod" inactive "patches reverted" || FAILED=true
+    fi
 
 done
 
 if [[ "$CHANGED" == "true" ]]; then
     info "Restarting pveproxy..."
-    if ! systemctl restart pveproxy; then FAILED=true; fi
+    if ! systemctl restart pveproxy; then
+        for mod in "${_target_modules[@]}"; do
+            transaction_status "$mod" error "pveproxy restart failed after revert; inspect service health" || true
+        done
+        FAILED=true
+    fi
 fi
 
 [[ "$FAILED" == "false" ]] || exit 1
