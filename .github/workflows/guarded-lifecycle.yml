@@ -21,6 +21,7 @@ jobs:
       - name: Run isolated lifecycle and installer tests
         run: |
           bash build/test/test-transactions.sh
+          bash build/test/test-guarded-inputs.sh
           bash build/test/test-upgrade-revert.sh
           bash build/test/test-patch-diagnostics.sh
           python3 build/test/test-installer.py
