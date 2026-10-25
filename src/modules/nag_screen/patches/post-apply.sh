@@ -6,4 +6,4 @@
 
 set -u
 
-exit 100
+exit 0

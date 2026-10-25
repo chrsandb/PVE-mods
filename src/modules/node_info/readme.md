@@ -53,6 +53,21 @@ EOF
 
 To uninstall delete the module load and udev rule.
 
+### CPU temperature display on large hosts
+
+CPU temperatures use a compact summary per hardware sensor group, rather than
+listing every core in the node summary. Core mode shows the actual package
+reading when available plus the core/CCD sensor count and minimum, average and
+maximum. Package mode prefers the package/die reading; AMD Tdie and offset Tctl
+are kept distinct. If the preferred reading is unavailable, existing core/CCD
+sensors remain available as a fallback.
+
+**Sensor details** opens a bounded, scrollable and sortable snapshot of all
+available CPU temperature channels, including package channels. It stays open
+while the summary refreshes; close and reopen it to take a new snapshot. Counts
+are temperature sensors, not logical CPU threads. Core numbers remain associated
+with their CPU group so multi-socket machines do not merge repeated core IDs.
+
 ### NVIDIA GPU
 
 Polls `nvidia-smi` on a configurable interval. Supports multiple GPUs. Metrics can be stored in RRD for historical graphing.

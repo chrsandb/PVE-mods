@@ -10,11 +10,78 @@
 
 set -euo pipefail
 
-CONF_FILE="/etc/pve-mods/pve-mods.conf"
-CONFD_DIR="/etc/pve-mods/conf.d"
+CONF_FILE="${PVE_MODs_MAIN_CONF:-/etc/pve-mods/pve-mods.conf}"
+CONFD_DIR="${PVE_MODs_CONFD_DIR:-/etc/pve-mods/conf.d}"
 APPLY_PATCHES="/usr/lib/pve-mods/apply-patches.sh"
 REVERT_PATCHES="/usr/lib/pve-mods/revert-patches.sh"
 NODES_PM="/usr/share/perl5/PVE/API2/Nodes.pm"
+PVE_MODs_ROOT="${PVE_MODs_ROOT:-/}"
+source "${PVE_MODs_TRANSACTION_HELPER:-/usr/lib/pve-mods/patch-transaction.sh}"
+declare -A WIZARD_HASHES
+wizard_hash() {
+    [[ ! -L "$1" ]] || return 1
+    if [[ -f "$1" ]]; then transaction_hash "$1"; else echo missing; fi
+}
+wizard_unlock() {
+    flock -u "$PVE_MODs_LOCK_FD"
+    exec {PVE_MODs_LOCK_FD}>&-
+}
+wizard_snapshot() {
+    local file
+    for file in "$CONF_FILE" "$CONFD_DIR/node_info.conf" "$CONFD_DIR/nag_screen.conf"; do
+        WIZARD_HASHES["$file"]=$(wizard_hash "$file") || return 1
+    done
+}
+wizard_save() {
+    local module="${1:-}" file stage failed=false main_target="$CONF_FILE"
+    local -a targets=("$CONF_FILE") written=()
+    [[ -z "$module" ]] || targets=("$CONFD_DIR/$module.conf" "$CONF_FILE")
+    stage=$(mktemp -d) || return 1
+    mkdir -p "$stage/new" "$stage/old"
+    [[ ! -f "$CONFD_DIR/nag_screen.conf" ]] || cp -a "$CONFD_DIR/nag_screen.conf" "$stage/new/nag_screen.conf" || { rm -rf "$stage"; return 1; }
+    # Render after prompts and any module package installation, without a lock.
+    (
+        CONF_FILE="$stage/new/main.conf"
+        NODE_INFO_CONF="$stage/new/node_info.conf"
+        NAG_SCREEN_CONF="$stage/new/nag_screen.conf"
+        write_main_conf
+        [[ -z "$module" ]] || "${module}_write_conf"
+    ) || { rm -rf "$stage"; return 1; }
+    transaction_lock || { rm -rf "$stage"; return 1; }
+    # All values were loaded together; refuse to overwrite a concurrent CLI or
+    # wizard edit, even to a config not selected by this invocation.
+    for file in "${!WIZARD_HASHES[@]}"; do
+        if [[ "$(wizard_hash "$file")" != "${WIZARD_HASHES[$file]}" ]]; then
+            warn 'Configuration changed while the wizard was open. Rerun it.'
+            wizard_unlock; rm -rf "$stage"; return 1
+        fi
+    done
+    mkdir -p "$(dirname "$main_target")" "$CONFD_DIR"
+    for file in "${targets[@]}"; do
+        local name="${file##*/}"
+        [[ "$file" != "$main_target" ]] || name=main.conf
+        if [[ -f "$file" ]]; then
+            cp -a "$file" "$stage/old/$name" || { failed=true; break; }
+            chmod --reference="$file" "$stage/new/$name" || { failed=true; break; }
+            chown --reference="$file" "$stage/new/$name" || { failed=true; break; }
+        else
+            chmod 644 "$stage/new/$name" || { failed=true; break; }
+        fi
+        written+=("$file")
+        if ! transaction_replace "$stage/new/$name" "$file"; then failed=true; break; fi
+    done
+    if [[ "$failed" == true ]]; then
+        for file in "${written[@]}"; do
+            local name="${file##*/}"
+            [[ "$file" != "$main_target" ]] || name=main.conf
+            if [[ -f "$stage/old/$name" ]]; then transaction_replace "$stage/old/$name" "$file" || true
+            else rm -f "$file"; fi
+        done
+    fi
+    wizard_unlock
+    rm -rf "$stage"
+    [[ "$failed" == false ]]
+}
 
 #region helpers
 # Blank-line spacing rule: section() is the only place that emits a leading
@@ -115,9 +182,12 @@ main() {
     MOD_NODE_INFO=0; MOD_NAG_SCREEN=0; PVE_TRIGGER_ENABLED=0
     node_info_defaults
     nag_screen_defaults
+    transaction_lock
+    wizard_snapshot
     _load_main_conf
     node_info_load_conf
     nag_screen_load_conf
+    wizard_unlock
 
     # ── Module / feature selection ────────────────────────────────────────────
     # Existing settings are loaded above; the user picks ONE option to (re)configure
@@ -142,7 +212,7 @@ main() {
                 node_info_configure
             fi
             # Write before patching so pveproxy restarts with the new config.
-            write_main_conf; node_info_write_conf
+            wizard_save node_info
             ;;
         2)
             selected_mod="nag_screen"
@@ -154,7 +224,7 @@ main() {
                 nag_screen_configure
             fi
             # Write before patching so pveproxy restarts with the new config.
-            write_main_conf; nag_screen_write_conf
+            wizard_save nag_screen
             ;;
         3)
             if [[ "$PVE_TRIGGER_ENABLED" == "1" ]]; then
@@ -162,7 +232,7 @@ main() {
             else
                 PVE_TRIGGER_ENABLED=1; info "Auto re-patching on PVE upgrade enabled."
             fi
-            write_main_conf  # no patches for this option
+            wizard_save  # no patches for this option
             ;;
         [nN]) info "No option selected. Exiting."; exit 0 ;;
         *)    warn "Invalid selection. Exiting."; exit 0 ;;
@@ -187,4 +257,4 @@ main() {
     info "Clear your browser cache to see the changes."
 }
 
-main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main; fi

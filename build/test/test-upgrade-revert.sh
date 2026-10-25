@@ -17,6 +17,7 @@ MOD_DIR="$PATCHES/test_mod"
 mkdir -p "$TMP_DIR/bin"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP_DIR/bin/systemctl"
 chmod +x "$TMP_DIR/bin/systemctl"
+export PATH="$TMP_DIR/bin:$PATH"
 
 mkdir -p "$ROOT/usr/share/demo" "$MOD_DIR" "$CONF"
 printf 'version=old\n' > "$ROOT/usr/share/demo/config"

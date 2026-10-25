@@ -4,6 +4,11 @@ set -e
 PATCHES_DIR="${PVE_MODs_PATCHES_DIR:-/usr/lib/pve-mods/patches}"
 PATCH_ROOT="${PVE_MODs_ROOT:-/}"
 CHANGED=false
+# Share the lifecycle lock even when upgrading from a release without helpers.
+lock="${PVE_MODs_LOCK_FILE:-${PVE_MODs_STATE_DIR:-${PATCH_ROOT%/}/var/lib/pve-mods}/lifecycle.lock}"
+mkdir -p "$(dirname "$lock")"
+exec {PVE_MODs_LOCK_FD}>"$lock"
+flock -w "${PVE_MODs_LOCK_TIMEOUT:-30}" "$PVE_MODs_LOCK_FD" || exit 1
 
 # Keep this diagnostic self-contained: preinst runs before package payload files
 # are installed, so the helper script may not yet exist on upgrade.
@@ -57,6 +62,23 @@ case "$1" in
                     done < "$manifest"
                 )
 
+                helper="${PVE_MODs_TRANSACTION_HELPER:-/usr/lib/pve-mods/patch-transaction.sh}"
+                if [[ -f "$helper" ]]; then
+                    source "$helper"
+                    PVE_MODs_ROOT="$PATCH_ROOT"
+                    ordered=()
+                    for (( i=${#patches[@]}-1; i>=0; i-- )); do
+                        ordered+=("${mod_dir}${patches[$i]}")
+                    done
+                    if ! transaction_patchset reverse "${ordered[@]}"; then
+                        echo '[pve-mods] ERROR: guarded upgrade reversion failed; no forced recovery.' >&2
+                        exit 1
+                    fi
+                    [[ "$TRANSACTION_CHANGED" == true ]] && CHANGED=true
+                    transaction_finish
+                else
+                    # Migration from old versions whose installed payload has
+                    # no transaction helper; retain the checked legacy path.
                 for (( i=${#patches[@]}-1; i>=0; i-- )); do
                     patch_file="${mod_dir}${patches[$i]}"
                     [ -f "$patch_file" ] || continue
@@ -74,6 +96,7 @@ case "$1" in
                         exit 1
                     fi
                 done
+                fi
             done
         fi
 

@@ -1,0 +1,44 @@
+name: Guarded lifecycle
+
+on:
+  pull_request:
+  push:
+    branches: [fix/guarded-updates]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Install validation and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends debhelper devscripts build-essential nodejs python3 shellcheck gnupg
+      - name: Run isolated lifecycle and installer tests
+        run: |
+          bash build/test/test-transactions.sh
+          bash build/test/test-guarded-inputs.sh
+          bash build/test/test-configure-lock.sh
+          bash build/test/test-upgrade-revert.sh
+          bash build/test/test-patch-diagnostics.sh
+          python3 build/test/test-installer.py
+          python3 build/test/test-management-cli.py
+          node build/test/test-cpu-layout.js
+          node --check src/modules/node_info/files/PveMods_pvemanagerlib.js
+          shellcheck install.sh tools/community-scripts/pve-hardware-monitor.sh
+          git diff --check
+      - name: Build Debian package
+        run: |
+          bash build/gen-rules.sh >> debian/rules
+          dpkg-buildpackage -us -uc -b
+      - name: Check installed management entry points
+        run: |
+          mkdir package-check
+          dpkg-deb -x ../pve-mods_*.deb package-check
+          test -x package-check/usr/sbin/pve-mods
+          test -r package-check/usr/lib/pve-mods/patch-transaction.sh
+          python3 package-check/usr/sbin/pve-mods --help

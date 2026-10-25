@@ -33,13 +33,35 @@ TBD PICTURE
 3. The wizard applies the selected patches to the PVE system files and restarts `pveproxy`.
 4. When upgrading `pve-mods`, the previous patches are reverted before package files are replaced, then the new version's patches are applied.
 
+### Guarded updates and host-tool integration
+
+This branch stages complete patch sets before touching live files, serializes
+its lifecycle operations, records module status, and withholds incompatible
+modifications. It does not hold Proxmox package updates. See
+[guarded update behavior and recovery](docs/guarded-updates.md).
+
+The management CLI supports `pve-mods status --json`, `pve-mods check --automatic
+node_info`, and `pve-mods configure --node-info --auto guarded`. Configuration
+alone does not apply patches. Automatic mode requires recognized package inputs
+and matching validators; a missing validator holds activation with a reason.
+
+The [community-scripts host-tool entry point](tools/community-scripts/README.md)
+uses the package lifecycle rather than a second patcher. It is prepared for
+DevScripts review, not yet an accepted community-scripts listing. No real-host
+upgrade or browser compatibility claim is made from fixture tests alone.
+
 ### Install
 
 Commands and mod configuration must be run as `root`.
 
 ```bash
-curl -sL https://raw.githubusercontent.com/Meliox/PVE-mods/refs/heads/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Meliox/PVE-mods/refs/heads/main/install.sh | bash
 ```
+
+For reproducible installations, download the installer from a reviewed commit
+and use `--version TAG`. Unattended `--yes` additionally requires an independently
+trusted `--keyring FILE --signing-fingerprint FULL_FINGERPRINT`. Checksum
+failures always stop installation; see the host-tool documentation for details.
 
 Install respective mod dependencies - see Mod table.
 
@@ -59,7 +81,7 @@ systemctl restart pveproxy
 To upgrade to the latest release, run the installer as `root`. It downloads and verifies the release package, then installs it over the current version; you do not need to uninstall first.
 
 ```bash
-curl -sL https://github.com/Meliox/PVE-mods/releases/latest/download/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Meliox/PVE-mods/refs/heads/main/install.sh | bash
 ```
 
 ### Uninstall

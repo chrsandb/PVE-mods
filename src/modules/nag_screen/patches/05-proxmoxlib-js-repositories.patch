@@ -1,5 +1,5 @@
---- /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js.orig	2026-09-27 12:31:57.553624715 +0200
-+++ /usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js	2026-09-27 12:43:53.586947583 +0200
+--- a/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
++++ b/usr/share/javascript/proxmox-widget-toolkit/proxmoxlib.js
 @@ -21170,21 +21163,7 @@
                  if (components === undefined) {
                      return '';
