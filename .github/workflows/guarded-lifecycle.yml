@@ -27,6 +27,8 @@ jobs:
           bash build/test/test-patch-diagnostics.sh
           python3 build/test/test-installer.py
           python3 build/test/test-management-cli.py
+          node build/test/test-cpu-layout.js
+          node --check src/modules/node_info/files/PveMods_pvemanagerlib.js
           shellcheck install.sh tools/community-scripts/pve-hardware-monitor.sh
           git diff --check
       - name: Build Debian package

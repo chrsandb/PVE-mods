@@ -104,6 +104,10 @@ function getSensorValue(feature, subfeature) {
         reading = reading.value;
     }
 
+    if (reading === null || reading === undefined || typeof reading === 'boolean'
+        || (typeof reading === 'string' && reading.trim() === '')) {
+        return NaN;
+    }
     const value = Number(reading);
     return Number.isFinite(value) ? value : NaN;
 }
@@ -135,6 +139,151 @@ function isSensorEnabled(sensorInfo, sensorType) {
 function getSensorIgnoreThreshold(sensorInfo, tempHelper) {
     const threshold = Number(sensorInfo.ignore_temp_below);
     return tempHelper.getTemp(Number.isFinite(threshold) ? threshold : 5);
+}
+
+// Temperature channels describe sensors, not logical CPU threads. Keep each
+// hardware group separate so identical core numbers on two sockets do not mix.
+function getCpuThermalGroups(sensorInfo) {
+    const payload = getSensorPayload(sensorInfo);
+    const threshold = Number(sensorInfo.ignore_temp_below);
+    const minimum = Number.isFinite(threshold) ? threshold : 5;
+    const coreMode = sensorInfo.cpu_temp_target === 'Core';
+    return Object.keys(payload).filter(key => /^(coretemp-isa-|k10temp-pci-|cpu_thermal-virtual-)/.test(key))
+        .sort((a, b) => a.localeCompare(b, undefined, {numeric: true})).map(key => {
+            const chip = payload[key];
+            if (!chip || typeof chip !== 'object') {
+                return null;
+            }
+            const intel = key.startsWith('coretemp-isa-');
+            const amd = key.startsWith('k10temp-pci-');
+            const rows = Object.keys(chip).filter(name => chip[name] && typeof chip[name] === 'object')
+                .map(name => {
+                    const feature = chip[name];
+                    const label = getSensorLabel(feature, name);
+                    let kind;
+                    if (intel && /^(?:P\s+Core|E\s+Core|Core)\s*\d+$/i.test(label)) {
+                        kind = 'core';
+                    } else if (intel && /^Package id\s*\d+$/i.test(label)) {
+                        kind = 'package';
+                    } else if (amd && /^Tccd\d+$/i.test(label)) {
+                        kind = 'ccd';
+                    } else if (amd && /^(Tdie|Tctl|CPU Core Temp)$/i.test(label)) {
+                        kind = 'package';
+                    } else if (!intel && /^temp\d+$/.test(name)) {
+                        kind = 'temperature';
+                    } else {
+                        return null;
+                    }
+                    const value = getSensorValue(feature, 'input');
+                    if (!Number.isFinite(value) || value < minimum) {
+                        return null;
+                    }
+                    const max = getSensorValue(feature, 'max');
+                    const critical = getSensorValue(feature, 'crit');
+                    const state = Number.isFinite(critical) && value >= critical ? 'Critical'
+                        : Number.isFinite(max) && value >= max ? 'Warning' : '';
+                    return {label, kind, value, max, critical, state};
+                }).filter(Boolean).sort((a, b) => a.label.localeCompare(b.label, undefined, {numeric: true}));
+            if (!rows.length) {
+                return null;
+            }
+            const cores = rows.filter(row => row.kind === 'core' || row.kind === 'ccd');
+            let packages = rows.filter(row => row.kind === 'package');
+            if (amd && packages.length) {
+                // Tctl may include an offset; never average it together with Tdie.
+                packages = [packages.find(row => row.label === 'Tdie')
+                    || packages.find(row => row.label === 'CPU Core Temp')
+                    || packages.find(row => row.label === 'Tctl') || packages[0]];
+            }
+            const selected = coreMode && cores.length ? cores : packages.length ? packages
+                : cores.length ? cores : rows;
+            const scope = selected[0].kind === 'core' ? 'Core sensors'
+                : selected[0].kind === 'ccd' ? 'CCD sensors' : 'Temperature sensors';
+            const packageId = String(chip.cpu_package ?? '').match(/^\d+$/)?.[0]
+                ?? rows.find(row => row.kind === 'package' && /^Package id/.test(row.label))?.label.match(/\d+/)?.[0];
+            return {id: key, label: packageId !== undefined ? `Package ${packageId}` : key,
+                model: typeof chip.cpu_model === 'string' ? chip.cpu_model : '',
+                rows, selected, scope, packages, coreMode};
+        }).filter(Boolean);
+}
+
+function formatCpuTemperature(value, fahrenheit) {
+    const converted = fahrenheit ? value * 9 / 5 + 32 : value;
+    return Number.isFinite(value) ? `${Ext.util.Format.number(converted, '0.0')}°${fahrenheit ? 'F' : 'C'}` : 'N/A';
+}
+
+function renderCpuThermalSummary(groups, fahrenheit) {
+    const encode = Ext.util.Format.htmlEncode;
+    if (!groups.length) {
+        return 'N/A';
+    }
+    const html = groups.map(group => {
+        const values = group.selected.map(row => row.value);
+        const count = values.length;
+        let summary;
+        if (count === 1) {
+            summary = `${encode(group.selected[0].label)}: ${formatCpuTemperature(values[0], fahrenheit)}`;
+        } else {
+            const average = values.reduce((sum, value) => sum + value, 0) / count;
+            summary = `${count} ${encode(group.scope === 'CCD sensors' ? group.scope : group.scope.toLowerCase())} · Min ${formatCpuTemperature(Math.min(...values), fahrenheit)}`
+                + ` · Avg ${formatCpuTemperature(average, fahrenheit)} · Max ${formatCpuTemperature(Math.max(...values), fahrenheit)}`;
+        }
+        // Core mode can also show the actual package reading without enumerating
+        // all cores. Package mode intentionally retains its configured focus.
+        if (group.coreMode && group.selected[0].kind !== 'package' && group.packages.length) {
+            summary = `${encode(group.packages[0].label)}: ${formatCpuTemperature(group.packages[0].value, fahrenheit)} · ${summary}`;
+        }
+        const state = group.rows.some(row => row.state === 'Critical') ? 'Critical'
+            : group.rows.some(row => row.state === 'Warning') ? 'Warning' : '';
+        const color = state === 'Critical' ? '#e44' : state === 'Warning' ? '#d89b00' : 'inherit';
+        return '<div style="min-width:0;padding:4px 0;">'
+            + `<div style="font-weight:600;overflow-wrap:anywhere;">${encode(group.label)}${group.model ? ` · ${encode(group.model)}` : ''}</div>`
+            + `<div style="overflow-wrap:anywhere;color:${color};">${summary}${state ? ` · ${state}` : ''}</div></div>`;
+    }).join('');
+    return '<div style="padding-left:20px;min-width:0;text-align:left;white-space:normal;">' + html
+        + '<button type="button" class="pve-mods-cpu-details" style="cursor:pointer;padding:3px 8px;background:transparent;color:inherit;border:1px solid currentColor;border-radius:3px;font:inherit;">'
+        + encode(gettext('Sensor details')) + '</button></div>';
+}
+
+function showCpuThermalDetails(widget) {
+    const groups = widget.cpuThermalGroups || [];
+    if (!groups.length) {
+        return;
+    }
+    if (widget.cpuThermalWindow && !widget.cpuThermalWindow.destroyed) {
+        widget.cpuThermalWindow.toFront();
+        return;
+    }
+    const fahrenheit = widget.cpuThermalFahrenheit;
+    const rows = groups.flatMap(group => group.rows.map(row => ({
+        group: group.label, model: group.model, sensor: row.label,
+        value: fahrenheit ? row.value * 9 / 5 + 32 : row.value,
+        state: row.state || (Number.isFinite(row.max) || Number.isFinite(row.critical) ? 'Below thresholds' : 'No threshold'),
+    })));
+    // A window stays open across summary polls, unlike inline <details> HTML
+    // that a renderer would replace. Label it explicitly as a point-in-time view.
+    widget.cpuThermalWindow = Ext.create('Ext.window.Window', {
+        title: gettext('CPU temperature sensors — snapshot'),
+        modal: true,
+        width: Math.max(280, Math.min(960, Ext.getBody().getViewSize().width - 32)),
+        height: Math.max(180, Math.min(560, Ext.getBody().getViewSize().height - 64)),
+        layout: 'fit',
+        items: [{
+            xtype: 'grid',
+            scrollable: true,
+            store: {fields: ['group', 'model', 'sensor', 'value', 'state'], data: rows},
+            columns: [
+                {text: gettext('CPU group'), dataIndex: 'group', width: 120, renderer: Ext.util.Format.htmlEncode},
+                {text: gettext('Sensor'), dataIndex: 'sensor', flex: 1, minWidth: 120, renderer: Ext.util.Format.htmlEncode},
+                {text: `°${fahrenheit ? 'F' : 'C'}`, dataIndex: 'value', width: 90,
+                    renderer: value => Ext.util.Format.number(value, '0.0')},
+                {text: gettext('State'), dataIndex: 'state', width: 130, renderer: Ext.util.Format.htmlEncode},
+                {text: gettext('CPU model'), dataIndex: 'model', flex: 1, minWidth: 180, renderer: Ext.util.Format.htmlEncode},
+            ],
+        }],
+        listeners: {destroy: function() { widget.cpuThermalWindow = null; }},
+    });
+    widget.cpuThermalWindow.show();
 }
 
 Ext.define('PVE.node.StatusView', {
@@ -258,173 +407,28 @@ Ext.define('PVE.node.StatusView', {
             title: gettext('CPU Thermal State'),
             iconCls: 'fa fa-fw fa-thermometer-half',
             textField: 'PveMods_SensorInfo',
-            renderer: function(cpuInfo){
-                // display configuration
-                const itemsPerRow = 0;
-                // ---
-                let objValue;
-                try {
-                    if (!isSensorEnabled(cpuInfo, 'cpu')) {
-                        this.hide();
-                        return '';
+            listeners: {
+                afterrender: function(widget) {
+                    widget.getEl().on('click', function() { showCpuThermalDetails(widget); }, null, {
+                        delegate: 'button.pve-mods-cpu-details',
+                    });
+                },
+                beforedestroy: function(widget) {
+                    if (widget.cpuThermalWindow && !widget.cpuThermalWindow.destroyed) {
+                        widget.cpuThermalWindow.close();
                     }
-                    objValue = getSensorPayload(cpuInfo);
-                } catch(e) {
+                },
+            },
+            renderer: function(cpuInfo) {
+                if (!isSensorEnabled(cpuInfo, 'cpu')) {
+                    this.cpuThermalGroups = [];
+                    this.hide();
                     return '';
                 }
-                // sensors configuration
-                const cpuTempHelper = Ext.create('PVE.mod.TempHelper', {srcUnit: PVE.mod.TempHelper.CELSIUS, dstUnit: cpuInfo.temp_unit === 'F' ? PVE.mod.TempHelper.FAHRENHEIT : PVE.mod.TempHelper.CELSIUS});
-                const cpuIgnoreThreshold = getSensorIgnoreThreshold(cpuInfo, cpuTempHelper);
-                const cpuKeysI = Object.keys(objValue).filter(item => String(item).startsWith('coretemp-isa-')).sort();
-                const cpuKeysA = Object.keys(objValue).filter(item => String(item).startsWith('k10temp-pci-')).sort();
-                const cpuKeysRpi = Object.keys(objValue).filter(item => String(item).startsWith('cpu_thermal-virtual-')).sort();
-                const bINTEL = cpuKeysI.length > 0 ? true : false;
-                const cpuTempTarget = cpuInfo.cpu_temp_target;
-                const INTELPackagePrefix = cpuTempTarget == 'Core' ? 'Core ' : 'Package id';
-                const INTELPackageCaption = cpuTempTarget == 'Core' ? 'Core' : 'Package';
-                let AMDPackagePrefix = 'Tccd';
-                let AMDPackageCaption = 'CCD';
-                
-                if (cpuKeysA.length > 0) {
-                    let bTccd = false;
-                    let bTctl = false;
-                    let bTdie = false;
-                    let bCpuCoreTemp = false;
-                    cpuKeysA.forEach((cpuKey, cpuIndex) => {
-                        let items = objValue[cpuKey];
-                        bTccd = Object.keys(items).some(item => getSensorLabel(items[item], item).startsWith('Tccd'));
-                        bTctl = Object.keys(items).some(item => getSensorLabel(items[item], item).startsWith('Tctl'));
-                        bTdie = Object.keys(items).some(item => getSensorLabel(items[item], item).startsWith('Tdie'));
-                        bCpuCoreTemp = Object.keys(items).some(item => getSensorLabel(items[item], item) === 'CPU Core Temp');
-                    });
-                    if (bTccd && 'Core' == 'Core') {
-                        AMDPackagePrefix = 'Tccd';
-                        AMDPackageCaption = 'ccd';
-                    } else if (bCpuCoreTemp && 'Core' == 'Package') {
-                        AMDPackagePrefix = 'CPU Core Temp';
-                        AMDPackageCaption = 'CPU Core Temp';
-                    } else if (bTdie) {
-                        AMDPackagePrefix = 'Tdie';
-                        AMDPackageCaption = 'die';
-                    } else if (bTctl) {
-                        AMDPackagePrefix = 'Tctl';
-                        AMDPackageCaption = 'ctl';
-                    } else {
-                        AMDPackagePrefix = 'temp';
-                        AMDPackageCaption = 'Temp';
-                    }
-                }
-                
-                const cpuKeys = bINTEL ? cpuKeysI : cpuKeysA.length > 0 ? cpuKeysA : cpuKeysRpi;
-                const cpuItemPrefix = bINTEL ? INTELPackagePrefix : cpuKeysA.length > 0 ? AMDPackagePrefix : 'temp';
-                const cpuTempCaption = bINTEL ? INTELPackageCaption : cpuKeysA.length > 0 ? AMDPackageCaption : 'SoC';
-                const formatTemp = bINTEL ? '0' : '0.0';
-                const cpuCount = cpuKeys.length;
-                let temps = [];
-                
-                cpuKeys.forEach((cpuKey, cpuIndex) => {
-                    let cpuTemps = [];
-                    const items = objValue[cpuKey];
-                    const cpuModel = items.cpu_model || '';
-                    
-                    const itemKeys = Object.keys(items).filter(item => { 
-                        const label = getSensorLabel(items[item], item);
-                        if ('Core' == 'Core') {
-                            // In Core mode: only show individual cores/CCDs, exclude overall CPU temp
-                            return label.includes(cpuItemPrefix) || label.startsWith('Tccd');
-                        } else {
-                            // In Package mode: show overall CPU temp and package-level readings
-                            return label.includes(cpuItemPrefix) || label === 'CPU Core Temp';
-                        }
-                    }).sort((a, b) => {
-                        // Sort cores numerically
-                        let numA = parseInt(getSensorLabel(items[a], a).match(/\d+/)?.[0] || '0', 10);
-                        let numB = parseInt(getSensorLabel(items[b], b).match(/\d+/)?.[0] || '0', 10);
-                        return numA - numB;
-                    });
-                    
-                    itemKeys.forEach((coreKey) => {
-                        try {
-                            const coreLabel = getSensorLabel(items[coreKey], coreKey);
-                            let tempVal = NaN, tempMax = NaN, tempCrit = NaN;
-                            tempVal = cpuTempHelper.getTemp(getSensorValue(items[coreKey], 'input'));
-                            tempMax = cpuTempHelper.getTemp(getSensorValue(items[coreKey], 'max'));
-                            tempCrit = cpuTempHelper.getTemp(getSensorValue(items[coreKey], 'crit'));
-                            
-                            if (!isNaN(tempVal) && tempVal >= cpuIgnoreThreshold) {
-                                let tempStyle = '';
-                                if (!isNaN(tempMax) && tempVal >= tempMax) {
-                                    tempStyle = 'color: #FFC300; font-weight: bold;';
-                                }
-                                if (!isNaN(tempCrit) && tempVal >= tempCrit) {
-                                    tempStyle = 'color: red; font-weight: bold;';
-                                }
-                                
-                                let tempStr = '';
-                                
-                                // Enhanced parsing for AMD temperatures
-                                if (coreLabel.startsWith('Tccd')) {
-                                    let tempIndex = coreLabel.match(/Tccd(\d+)/);
-                                    if (tempIndex !== null && tempIndex.length > 1) {
-                                        tempIndex = tempIndex[1];
-                                        tempStr = `${cpuTempCaption}&nbsp;${tempIndex}:&nbsp;<span style="${tempStyle}">${Ext.util.Format.number(tempVal, formatTemp)}${cpuTempHelper.getUnit()}</span>`;
-                                    } else {
-                                        tempStr = `${cpuTempCaption}:&nbsp;<span style="${tempStyle}">${Ext.util.Format.number(tempVal, formatTemp)}${cpuTempHelper.getUnit()}</span>`;
-                                    }
-                                }
-                                // Handle CPU Core Temp (single overall temperature)
-                                else if (coreLabel === 'CPU Core Temp') {
-                                    tempStr = `${cpuTempCaption}:&nbsp;<span style="${tempStyle}">${Ext.util.Format.number(tempVal, formatTemp)}${cpuTempHelper.getUnit()}</span>`;
-                                }
-                                // Enhanced parsing for Intel cores (P-Core, E-Core, regular Core)
-                                else {
-                                    let tempIndex = coreLabel.match(/(?:P\s+Core|E\s+Core|Core)\s*(\d+)/);
-                                    if (tempIndex !== null && tempIndex.length > 1) {
-                                        tempIndex = tempIndex[1];
-                                        let coreType = coreLabel.startsWith('P Core') ? 'P Core' :
-                                                    coreLabel.startsWith('E Core') ? 'E Core' :
-                                                    cpuTempCaption;
-                                        tempStr = `${coreType}&nbsp;${tempIndex}:&nbsp;<span style="${tempStyle}">${Ext.util.Format.number(tempVal, formatTemp)}${cpuTempHelper.getUnit()}</span>`;
-                                    } else {
-                                        // fallback for CPUs which do not have a core index
-                                        let coreType = coreLabel.startsWith('P Core') ? 'P Core' :
-                                            coreLabel.startsWith('E Core') ? 'E Core' :
-                                            cpuTempCaption;
-                                        tempStr = `${coreType}:&nbsp;<span style="${tempStyle}">${Ext.util.Format.number(tempVal, formatTemp)}${cpuTempHelper.getUnit()}</span>`;
-                                    }
-                                }
-                                
-                                cpuTemps.push(tempStr);
-                            }
-                        } catch (e) { /*_*/ }
-                    });
-                    
-                    if(cpuTemps.length > 0) {
-                        temps.push({ model: cpuModel, temps: cpuTemps });
-                    }
-                });
-                
-                let html = '<table style="width: 100%; border-collapse: collapse; table-layout: fixed;">';
-                temps.forEach((cpuData, cpuIndex) => {
-                    const strCoreTemps = cpuData.temps.map((strTemp, index, arr) => { 
-                        return strTemp + (index + 1 < arr.length ? (itemsPerRow > 0 && (index + 1) % itemsPerRow === 0 ? '<br>' : '&nbsp;| ') : ''); 
-                    });
-                    if(strCoreTemps.length > 0) {
-                        let cpuLabel = cpuCount > 1 ? `Socket ${cpuIndex + 1}` : 'Socket 1';
-                        let cpuModelStr = cpuData.model || 'Unknown CPU';
-                        
-                        html += '<tr>';
-                        html += `<td style="padding: 2px 10px 2px 0; text-align: left; width: 30%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word;">${cpuModelStr}</td>`;
-                        html += `<td style="padding: 2px 0 2px 10px; text-align: right; width: 70%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; white-space: normal;">${strCoreTemps.join('')}</td>`;
-                        html += '</tr>';
-                    }
-                });
-                html += '</table>';
-				
-                return html.indexOf('<tr>') > 0
-                    ? '<div style="padding-left: 20px; box-sizing: border-box;">' + html + '</div>'
-                    : 'N/A';
-            }
+                this.cpuThermalGroups = getCpuThermalGroups(cpuInfo);
+                this.cpuThermalFahrenheit = cpuInfo.temp_unit === 'F';
+                return renderCpuThermalSummary(this.cpuThermalGroups, this.cpuThermalFahrenheit);
+            },
         },
         {
             itemId: 'gpu_details',
